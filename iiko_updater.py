@@ -7,9 +7,9 @@ import threading
 import zipfile
 import time
 import re
-import glob
 import sys
 from urllib.parse import urlparse
+from tqdm import tqdm
 import ctypes # Для проверки прав администратора и UAC
 from ctypes import wintypes # Для проверки прав администратора
 
@@ -24,16 +24,14 @@ DEFAULT_CONFIG = {
 REQUIRED_BACKUP_FOLDERS = ['exploded', 'tools', 'tomcat9', 'logs']
 FOLDERS_TO_REPLACE = ['exploded', 'tools', 'tomcat9']
 LOG_FILE_NAME = 'startup.log'
-SUCCESS_LOG_MESSAGE = 'Started successfull'
+SUCCESS_LOG_MESSAGE = 'STARTED_SUCCESSFULLY'
 SERVICE_POLL_INTERVAL = 2 # seconds
-SERVICE_TIMEOUT = 60 # seconds
+SERVICE_TIMEOUT = 600 # seconds
 LOG_POLL_INTERVAL = 1 # seconds
 LOG_TIMEOUT = 300 # seconds (5 minutes)
 
 try:
     from colorama import Fore, Style, init
-    # Инициализируем colorama. autoreset=True автоматически сбрасывает цвет после каждого print.
-    init(autoreset=True)
 
     # Определяем наши цвета для удобства
     COLOR_MAP = {
@@ -49,7 +47,7 @@ try:
     def cprint(text, color=''):
         """Выводит цветной текст."""
         color_code = COLOR_MAP.get(color, '')
-        print(f"{color_code}{text}")
+        print(f"{color_code}{text}{Style.RESET_ALL}")
 
     def prompt(text):
         """Запрашивает ввод у пользователя с цветным текстом."""
@@ -485,19 +483,29 @@ def download_update_archive(version_info, download_dir, ftp_conn=None):
              return None
         cprint(f"Скачивание '{archive_name}' из '{source_path}' (FTP) в '{local_file_path}'...", 'step')
         try:
-            ftp_cwd_path = source_path.lstrip('/')
-            ftp_conn.cwd(ftp_cwd_path)
+            absolute_ftp_path = '/' + source_path.strip('/')
+            ftp_conn.cwd(absolute_ftp_path)
+
+            file_size = ftp_conn.size(archive_name)
             with open(local_file_path, 'wb') as local_file:
-                ftp_conn.retrbinary('RETR ' + archive_name, local_file.write)
+                with tqdm(
+                    total=file_size,
+                    unit='B', unit_scale=True, unit_divisor=1024,
+                    desc=archive_name,
+                    ascii=True # Для лучшей совместимости с консолями
+                ) as progress:
+                    def progress_callback(chunk):
+                        local_file.write(chunk)
+                        progress.update(len(chunk))
+                    
+                    ftp_conn.retrbinary(f'RETR {archive_name}', progress_callback)
             cprint("Скачивание завершено.", 'success')
-            ftp_conn.cwd('..')
+            try:
+                ftp_conn.cwd('/')
+            except ftplib.all_errors:
+                pass
             return local_file_path
-        except ftplib.all_errors as e:
-            cprint(f"Ошибка при скачивании файла с FTP: {e}", 'error')
-            try: ftp_conn.cwd('..')
-            except: pass
-            if os.path.exists(local_file_path): os.remove(local_file_path)
-            return None
+        
         except Exception as e:
             cprint(f"Неизвестная ошибка при скачивании файла с FTP: {e}", 'error')
             try: ftp_conn.cwd('..')
@@ -509,7 +517,24 @@ def download_update_archive(version_info, download_dir, ftp_conn=None):
         smb_file_path = os.path.join(source_path, archive_name)
         cprint(f"Копирование '{smb_file_path}' (SMB) в '{local_file_path}'...", 'step')
         try:
-            shutil.copy2(smb_file_path, local_file_path)
+            file_size = os.path.getsize(smb_file_path)
+            chunk_size = 1024 * 1024
+
+            with open(smb_file_path, 'rb') as fsrc:
+                with open(local_file_path, 'wb') as fdst:
+                    with tqdm(
+                        total=file_size,
+                        unit='B', unit_scale=True, unit_divisor=1024,
+                        desc=archive_name,
+                        ascii=True
+                    ) as progress:
+                        while True:
+                            chunk = fsrc.read(chunk_size)
+                            if not chunk:
+                                break
+                            fdst.write(chunk)
+                            progress.update(len(chunk))
+            
             cprint("Копирование завершено.", 'success')
             return local_file_path
         except FileNotFoundError:
@@ -531,15 +556,17 @@ def download_update_archive(version_info, download_dir, ftp_conn=None):
 
 def backup_server_folders(server_dir, backup_base_dir):
     """
-    Очищает .exe установщики из папки 'exploded', затем перемещает
-    указанные папки сервера в директорию бэкапа.
+    Создает бэкап. Для папок 'exploded', 'tools', 'tomcat9' - перемещает их целиком.
+    Для папки 'logs' - оставляет ее на месте, но перемещает ее содержимое в бэкап.
     """
     timestamp = time.strftime('%Y%m%d_%H%M%S')
     backup_target_dir = os.path.join(backup_base_dir, f"iiko_backup_{timestamp}")
     
-    cprint(f"Создание бэкапа путем перемещения папок в '{backup_target_dir}'...", 'step')
+    cprint(f"Создание бэкапа в '{backup_target_dir}'...", 'step')
     
-    cprint("  Предварительная очистка файлов установщиков из папки 'exploded'...", 'step')
+    # Предварительная очистка .exe файлов из папки 'exploded'
+    # (Эта логика остается без изменений)
+    print("  Предварительная очистка файлов установщиков из папки 'exploded'...")
     installers_to_clean = [
         os.path.join(server_dir, 'exploded', 'update', 'Front', 'Setup.Front.exe'),
         os.path.join(server_dir, 'exploded', 'update', 'BackOffice', 'Setup.RMS.BackOffice.exe'),
@@ -549,30 +576,57 @@ def backup_server_folders(server_dir, backup_base_dir):
         if os.path.exists(installer_path):
             try:
                 os.remove(installer_path)
-                cprint(f"    Удален старый установщик: {os.path.basename(installer_path)}", 'info')
+                print(f"    Удален старый установщик: {os.path.basename(installer_path)}")
             except Exception as e:
-                # Не критическая ошибка, просто предупреждаем
                 cprint(f"    ПРЕДУПРЕЖДЕНИЕ: Не удалось удалить файл '{installer_path}': {e}", 'warning')
 
     os.makedirs(backup_target_dir, exist_ok=True)
     
+    # Список папок, которые были перемещены целиком (для отката)
     moved_folders = []
     try:
         for folder_name in REQUIRED_BACKUP_FOLDERS:
             src_path = os.path.join(server_dir, folder_name)
-            dest_path = os.path.join(backup_target_dir, folder_name)
-            if os.path.exists(src_path):
+            
+            if not os.path.exists(src_path):
+                cprint(f"  Предупреждение: Папка '{folder_name}' не найдена. Пропускаю.", 'warning')
+                continue
+
+            if folder_name == 'logs':
+                cprint(f"  Очистка папки '{folder_name}' (перемещение содержимого в бэкап)...", 'info')
+                
+                # Создаем папку 'logs' в директории бэкапа
+                dest_logs_path = os.path.join(backup_target_dir, 'logs')
+                os.makedirs(dest_logs_path, exist_ok=True)
+                
+                # Перемещаем каждый элемент из исходной папки logs в бэкап
+                items_to_move = os.listdir(src_path)
+                if not items_to_move:
+                    cprint(f"    Папка '{folder_name}' пуста. Пропускаю.", 'info')
+                    continue
+
+                for item in items_to_move:
+                    item_src_path = os.path.join(src_path, item)
+                    item_dest_path = os.path.join(dest_logs_path, item)
+                    shutil.move(item_src_path, item_dest_path)
+                
+                cprint(f"    Содержимое папки '{folder_name}' успешно перемещено. Сама папка сохранена.", 'success')
+                # Важно: мы не добавляем 'logs' в список moved_folders, так как сама папка не перемещалась
+
+            else:
+                dest_path = os.path.join(backup_target_dir, folder_name)
                 cprint(f"  Перемещение папки '{folder_name}'...", 'info')
                 shutil.move(src_path, dest_path)
-                moved_folders.append(folder_name)
-                cprint("  Успешно.", 'success')
-            else:
-                cprint(f"  Предупреждение: Папка '{folder_name}' не найдена в '{server_dir}'. Пропускаю.", 'warning')
+                moved_folders.append(folder_name) # Добавляем в список для отката
+                cprint("    Успешно.", 'success')
         
         return backup_target_dir
+        
     except Exception as e:
-        cprint(f"!!! КРИТИЧЕСКАЯ ОШИБКА при перемещении папок для бэкапа: {e}", 'error')
+        cprint(f"!!! КРИТИЧЕСКАЯ ОШИБКА при создании бэкапа: {e}", 'error')
         cprint("!!! Попытка откатить перемещение...", 'warning')
+        
+        # Логика отката затронет только те папки, которые были перемещены целиком
         for folder_name in moved_folders:
             backup_folder_path = os.path.join(backup_target_dir, folder_name)
             original_path = os.path.join(server_dir, folder_name)
@@ -582,7 +636,6 @@ def backup_server_folders(server_dir, backup_base_dir):
                     cprint(f"  Папка '{folder_name}' возвращена на место.", 'success')
             except Exception as rollback_e:
                 cprint(f"!!! НЕ УДАЛОСЬ вернуть папку '{folder_name}': {rollback_e}", 'error')
-                cprint(f"!!! ПРОВЕРЬТЕ ВРУЧНУЮ: папка должна быть в {backup_target_dir}", 'error')
         return None
 
 def perform_update(server_info, downloaded_archive_path, backup_base_dir, selected_version_info, ftp_conn=None):
@@ -728,181 +781,201 @@ def perform_update(server_info, downloaded_archive_path, backup_base_dir, select
 
 def upload_backup(config, source_versions_root, local_backup_path, service_name, source_type, ftp_conn=None):
     """
-    Архивирует локальный бэкап, загружает его на FTP или SMB и удаляет локальную копию.
-    Использует корневую папку версий для правильного расчета пути назначения.
+    Архивирует, загружает бэкап с прогресс-баром и удаляет локальную копию.
     """
     if not os.path.isdir(local_backup_path):
-        cprint(f"!!! Ошибка: Директория бэкапа '{local_backup_path}' не найдена для загрузки.", 'error')
+        cprint(f"Ошибка: Директория бэкапа '{local_backup_path}' не найдена.", 'error')
         return False
 
-    cprint(f"\n--- Загрузка бэкапа на {source_type.upper()} ---", 'step')
+    cprint(f"\n--- Загрузка бэкапа на {source_type.upper()} ---", 'header')
 
-    # 1. Создание ZIP-архива
     timestamp = time.strftime('%Y%m%d_%H%M%S')
     archive_base_name = f"{service_name}_backup_{timestamp}"
     temp_archive_path = os.path.join(config['General']['download_dir'], archive_base_name)
     
-    cprint(f"Создание ZIP-архива '{archive_base_name}.zip'...", 'info')
+    cprint(f"Создание ZIP-архива '{archive_base_name}.zip'...", 'step')
     try:
         final_archive_path = shutil.make_archive(
-            base_name=temp_archive_path,
-            format='zip',
-            root_dir=os.path.dirname(local_backup_path),
-            base_dir=os.path.basename(local_backup_path)
+            base_name=temp_archive_path, format='zip',
+            root_dir=os.path.dirname(local_backup_path), base_dir=os.path.basename(local_backup_path)
         )
         cprint(f"Архив успешно создан: '{final_archive_path}'", 'success')
     except Exception as e:
-        cprint(f"!!! Ошибка при создании ZIP-архива бэкапа: {e}", 'error')
+        cprint(f"Ошибка при создании ZIP-архива: {e}", 'error')
         return False
 
-    # 2. *** ЛОГИКА ОПРЕДЕЛЕНИЯ ПУТИ НАЗНАЧЕНИЯ ***
     try:
-        cprint(f"  Базовый путь для расчета: '{source_versions_root}'", 'info')
-        # Идем на 2 уровня вверх от корневой папки с версиями (например, от \\...\\distr\\iiko)
-        parent_of_root = os.path.dirname(source_versions_root)      # -> \\...\\distr
-        grandparent_of_root = os.path.dirname(parent_of_root)   # -> \\...\\sharedisk
-        
-        # Формируем целевой путь в папке temp на нужном уровне
+        parent_of_root = os.path.dirname(source_versions_root)
+        grandparent_of_root = os.path.dirname(parent_of_root)
         destination_dir = os.path.join(grandparent_of_root, 'temp', 'update_backups')
-        cprint(f"  Рассчитан путь назначения для бэкапов: '{destination_dir}'", 'success')
     except Exception as e:
-        cprint(f"!!! Не удалось рассчитать путь назначения для бэкапа: {e}", 'error')
+        cprint(f"Не удалось рассчитать путь назначения для бэкапа: {e}", 'error')
         os.remove(final_archive_path)
         return False
 
     upload_successful = False
     try:
-        # 3. Логика загрузки
+        file_size = os.path.getsize(final_archive_path)
+        archive_name = os.path.basename(final_archive_path)
+
         if source_type == 'smb':
-            cprint(f"Проверка/создание директории на SMB: '{destination_dir}'", 'info')
+            cprint(f"Загрузка архива на SMB...", 'step')
             os.makedirs(destination_dir, exist_ok=True)
-            destination_file_path = os.path.join(destination_dir, os.path.basename(final_archive_path))
-            cprint(f"Загрузка (перемещение) архива на SMB в '{destination_file_path}'...", 'step')
-            shutil.move(final_archive_path, destination_file_path)
+            destination_file_path = os.path.join(destination_dir, archive_name)
+            
+            # Копируем с прогресс-баром
+            chunk_size = 1024 * 1024
+            with open(final_archive_path, 'rb') as fsrc:
+                with open(destination_file_path, 'wb') as fdst:
+                    with tqdm(
+                        total=file_size, unit='B', unit_scale=True, unit_divisor=1024,
+                        desc=archive_name, ascii=True
+                    ) as progress:
+                        while True:
+                            chunk = fsrc.read(chunk_size)
+                            if not chunk: break
+                            fdst.write(chunk)
+                            progress.update(len(chunk))
+            
+            os.remove(final_archive_path) # Удаляем исходный файл после копирования
             cprint("Загрузка на SMB завершена.", 'success')
             upload_successful = True
 
         elif source_type == 'ftp':
-            if not ftp_conn:
-                raise ConnectionError("FTP соединение не установлено для загрузки бэкапа.")
+            if not ftp_conn: raise ConnectionError("FTP соединение не установлено.")
+            cprint(f"Загрузка архива на FTP...", 'step')
             
             destination_dir_ftp = destination_dir.replace('\\', '/')
-            cprint(f"Проверка/создание директории на FTP: '{destination_dir_ftp}'", 'info')
-            
             try:
                 ftp_conn.cwd('/')
                 path_parts = [part for part in destination_dir_ftp.split('/') if part]
                 for part in path_parts:
-                    try:
-                        ftp_conn.cwd(part)
+                    try: ftp_conn.cwd(part)
                     except ftplib.error_perm:
-                        cprint(f"  Создание директории '{part}' на FTP...", 'info')
                         ftp_conn.mkd(part)
                         ftp_conn.cwd(part)
             except ftplib.all_errors as e:
                 raise IOError(f"Не удалось создать/перейти в директорию на FTP: {e}")
 
-            ftp_file_name = os.path.basename(final_archive_path)
-            cprint(f"Загрузка архива '{ftp_file_name}' на FTP...", 'step')
-            with open(final_archive_path, 'rb') as file_obj:
-                ftp_conn.storbinary(f'STOR {ftp_file_name}', file_obj)
+            # Загружаем файл с прогресс-баром
+            with open(final_archive_path, 'rb') as f:
+                with tqdm(
+                    total=file_size, unit='B', unit_scale=True, unit_divisor=1024,
+                    desc=archive_name, ascii=True
+                ) as progress:
+                    # Создаем коллбэк, который будет передавать РАЗМЕР блока, а не сам блок
+                    def progress_callback(chunk):
+                        progress.update(len(chunk))
+                    
+                    ftp_conn.storbinary(f'STOR {archive_name}', f, callback=progress_callback)
+            
+            os.remove(final_archive_path)
             cprint("Загрузка на FTP завершена.", 'success')
             upload_successful = True
-            os.remove(final_archive_path)
 
     except Exception as e:
-        cprint(f"!!! Ошибка при загрузке бэкапа: {e}", 'error')
+        cprint(f"Ошибка при загрузке бэкапа: {e}", 'error')
         if os.path.exists(final_archive_path):
-             cprint(f"!!! Локальный архив сохранен для ручного копирования: {final_archive_path}", 'warning')
+             cprint(f"Локальный архив сохранен для ручного копирования: {final_archive_path}", 'warning')
         return False
 
-    # 4. Очистка локальной папки бэкапа
     if upload_successful:
         cprint(f"Очистка локальной папки бэкапа: '{local_backup_path}'...", 'step')
         try:
             shutil.rmtree(local_backup_path)
             cprint("Локальный бэкап успешно удален.", 'success')
         except Exception as e:
-            cprint(f"!!! ПРЕДУПРЕЖДЕНИЕ: Не удалось удалить локальную папку бэкапа: {e}", 'warning')
+            cprint(f"ПРЕДУПРЕЖДЕНИЕ: Не удалось удалить локальную папку бэкапа: {e}", 'warning')
     
     return upload_successful
 
 def download_and_place_installers(server_info, update_source_info, ftp_conn=None):
     """
-    Находит, загружает и размещает .exe установщики в соответствующие папки сервера.
+    Находит, загружает и размещает .exe установщики с отображением прогресс-бара.
     """
     server_type = server_info['type']
     server_dir = server_info['server_dir']
     source_type = update_source_info['source']
-    source_path = update_source_info['path'] # Путь к папке с версией, e.g., .../iiko/917
+    source_path = update_source_info['path']
 
     cprint(f"  Поиск и размещение установщиков для сервера типа '{server_type}'...", 'step')
 
-    # Определяем, какие файлы искать и куда их класть
-    # Формат: { 'имя_файла.exe': 'целевая_подпапка' }
     installer_map = {
         'Setup.Front.exe': 'Front',
         'Setup.RMS.BackOffice.exe': 'BackOffice',
         'Setup.Chain.BackOffice.exe': 'BackOffice'
     }
 
-    # Выбираем нужные файлы в зависимости от типа сервера
     files_to_process = []
     if server_type == 'iikoRMS':
         files_to_process = ['Setup.Front.exe', 'Setup.RMS.BackOffice.exe']
     elif server_type == 'iikoChain':
         files_to_process = ['Setup.Chain.BackOffice.exe']
     else:
-        cprint(f"  ПРЕДУПРЕЖДЕНИЕ: Неизвестный тип сервера '{server_type}', пропускаю загрузку установщиков.", 'warning')
-        return True # Не критическая ошибка, продолжаем
+        cprint(f"  Неизвестный тип сервера '{server_type}', пропускаю загрузку.", 'warning')
+        return True
 
     all_successful = True
     for filename in files_to_process:
         try:
-            # 1. Определяем путь назначения
             target_subdir = installer_map.get(filename)
             if not target_subdir: continue
 
             destination_folder = os.path.join(server_dir, 'exploded', 'update', target_subdir)
             destination_file_path = os.path.join(destination_folder, filename)
-
-            # 2. Убеждаемся, что папка назначения существует
             os.makedirs(destination_folder, exist_ok=True)
 
-            # 3. Копируем или скачиваем файл
             if source_type == 'smb':
                 source_file_path = os.path.join(source_path, filename)
                 if os.path.exists(source_file_path):
-                    cprint(f"    Копирование '{filename}' в '{destination_folder}'...", 'step')
-                    shutil.copy2(source_file_path, destination_file_path)
+                    # --- TQDM-based copy for SMB ---
+                    file_size = os.path.getsize(source_file_path)
+                    chunk_size = 1024 * 1024
+                    with open(source_file_path, 'rb') as fsrc:
+                        with open(destination_file_path, 'wb') as fdst:
+                            with tqdm(
+                                total=file_size, unit='B', unit_scale=True, unit_divisor=1024,
+                                desc=filename, ascii=True
+                            ) as progress:
+                                while True:
+                                    chunk = fsrc.read(chunk_size)
+                                    if not chunk: break
+                                    fdst.write(chunk)
+                                    progress.update(len(chunk))
                 else:
-                    cprint(f"    ПРЕДУПРЕЖДЕНИЕ: Установщик '{filename}' не найден на SMB по пути '{source_file_path}'.", 'warning')
+                    cprint(f"    ПРЕДУПРЕЖДЕНИЕ: Установщик '{filename}' не найден на SMB.", 'warning')
                     all_successful = False
 
             elif source_type == 'ftp':
-                if not ftp_conn:
-                    raise ConnectionError("FTP соединение не установлено для загрузки установщиков.")
+                if not ftp_conn: raise ConnectionError("FTP соединение не установлено.")
                 
-                cprint(f"    Скачивание '{filename}' в '{destination_folder}'...", 'step')
-                # Переходим в директорию с версией на FTP
-                ftp_conn.cwd(f"/{source_path.replace('\\', '/')}")
+                # --- TQDM-based download for FTP ---
+                absolute_ftp_path = '/' + source_path.strip('/')
+                ftp_conn.cwd(absolute_ftp_path)
                 
-                # Проверяем наличие файла
                 file_list = ftp_conn.nlst()
                 if filename in file_list:
+                    file_size = ftp_conn.size(filename)
                     with open(destination_file_path, 'wb') as local_file:
-                        ftp_conn.retrbinary(f'RETR {filename}', local_file.write)
+                        with tqdm(
+                            total=file_size, unit='B', unit_scale=True, unit_divisor=1024,
+                            desc=filename, ascii=True
+                        ) as progress:
+                            def progress_callback(chunk):
+                                local_file.write(chunk)
+                                progress.update(len(chunk))
+                            
+                            ftp_conn.retrbinary(f'RETR {filename}', progress_callback)
                 else:
-                    cprint(f"    ПРЕДУПРЕЖДЕНИЕ: Установщик '{filename}' не найден на FTP в директории '{source_path}'.", 'warning')
+                    cprint(f"    ПРЕДУПРЕЖДЕНИЕ: Установщик '{filename}' не найден на FTP.", 'warning')
                     all_successful = False
                 
-                # Возвращаемся на уровень выше, чтобы не нарушать другие операции
-                ftp_conn.cwd('..')
+                try: ftp_conn.cwd('/')
+                except: pass
 
         except Exception as e:
             cprint(f"!!! ОШИБКА при обработке установщика '{filename}': {e}", 'error')
             all_successful = False
-            # Если была ошибка с FTP, пытаемся вернуться в корень для стабильности
             if source_type == 'ftp' and ftp_conn:
                 try: ftp_conn.cwd('/')
                 except: pass
@@ -949,6 +1022,8 @@ def monitor_log_in_thread(log_path, stop_event, success_event, success_message):
 # --- Основная логика программы ---
 
 if __name__ == "__main__":
+    
+    init() # Инициализация colorama
     cprint("--- Утилита автоматизированного обновления серверов iikoRMS ---", 'header')
     
     # Попытка повышения прав UAC
