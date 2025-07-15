@@ -28,7 +28,7 @@ SUCCESS_LOG_MESSAGE = 'STARTED_SUCCESSFULLY'
 SERVICE_POLL_INTERVAL = 2 # seconds
 SERVICE_TIMEOUT = 600 # seconds
 LOG_POLL_INTERVAL = 1 # seconds
-LOG_TIMEOUT = 300 # seconds (5 minutes)
+LOG_TIMEOUT = 900 # seconds (15 minutes)
 
 try:
     from colorama import Fore, Style, init
@@ -678,6 +678,12 @@ def perform_update(server_info, downloaded_archive_path, backup_base_dir, select
         if len(extracted_items) == 1 and os.path.isdir(os.path.join(extract_dir, extracted_items[0])):
             source_base_dir = os.path.join(extract_dir, extracted_items[0])
             cprint(f"  Обнаружена корневая папка в архиве: '{extracted_items[0]}'. Работаем из нее.", 'info')
+            
+        # переносим кастомные .jar если есть
+        migrate_custom_libs(
+            backup_path=backup_path,
+            source_base_dir=source_base_dir
+        )
         for folder_name in FOLDERS_TO_REPLACE:
             src_path = os.path.join(source_base_dir, folder_name)
             dest_path = os.path.join(server_dir, folder_name)
@@ -750,6 +756,12 @@ def perform_update(server_info, downloaded_archive_path, backup_base_dir, select
                 # Ждем 1 секунду. Это позволяет циклу быть отзывчивым к Ctrl+C
                 time.sleep(1)
 
+            if success_event.is_set():
+                cprint("\nОБНОВЛЕНИЕ УСПЕШНО ЗАВЕРШЕНО: Найдено сообщение об успехе.", 'success')
+                return True, backup_path, False
+            
+            raise RuntimeError("Неожиданное завершение цикла мониторинга.")
+        
         except KeyboardInterrupt:
             cprint("\nМониторинг прерван пользователем. Переход к следующему шагу...", 'step')
             monitoring_interrupted = True
@@ -778,6 +790,82 @@ def perform_update(server_info, downloaded_archive_path, backup_base_dir, select
         if os.path.exists(downloaded_archive_path):
             try: os.remove(downloaded_archive_path)
             except Exception as e: print(f"  ПРЕДУПРЕЖДЕНИЕ: Не удалось удалить скачанный архив '{downloaded_archive_path}': {e}")
+
+def migrate_custom_libs(backup_path, source_base_dir):
+    """
+    Сравнивает библиотеки в старой и новой версии, и предлагает перенести недостающие.
+    """
+    cprint("\nШаг 3.5: Проверка на наличие кастомных библиотек...", 'step')
+
+    # 1. Определяем пути к папкам /lib в старой (бэкап) и новой (распакованной) версиях
+    old_lib_path = os.path.join(backup_path, 'exploded', 'WEB-INF', 'lib')
+    new_lib_path = os.path.join(source_base_dir, 'exploded', 'WEB-INF', 'lib')
+
+    # 2. Проверяем, существуют ли обе директории
+    if not os.path.isdir(old_lib_path) or not os.path.isdir(new_lib_path):
+        cprint("  Одна из папок 'lib' не найдена. Пропускаю сравнение.", 'warning')
+        return
+
+    # 3. Получаем списки файлов и находим разницу
+    try:
+        old_files = set(os.listdir(old_lib_path))
+        new_files = set(os.listdir(new_lib_path))
+        
+        # Находим файлы, которые есть в старой версии, но отсутствуют в новой
+        extra_files = sorted(list(old_files - new_files))
+
+    except Exception as e:
+        cprint(f"  Ошибка при сравнении содержимого папок 'lib': {e}", 'error')
+        return
+
+    # 4. Если различий нет, сообщаем и выходим
+    if not extra_files:
+        cprint("  Кастомные библиотеки не найдены. Состав идентичен.", 'success')
+        return
+
+    # 5. Если найдены различия, выводим их и запрашиваем действие у пользователя
+    cprint("  ВНИМАНИЕ: Найдены библиотеки, отсутствующие в новой версии:", 'warning')
+    for i, filename in enumerate(extra_files, 1):
+        print(f"    {i}. {filename}")
+    
+    user_input = prompt("\nВведите номера файлов для переноса (через запятую, например: 1,3) или нажмите Enter, чтобы пропустить: ")
+
+    if not user_input.strip():
+        cprint("  Перенос кастомных библиотек пропущен пользователем.", 'info')
+        return
+
+    # 6. Парсим ввод пользователя и переносим выбранные файлы
+    selected_indices = []
+    parts = user_input.split(',')
+    for part in parts:
+        try:
+            index = int(part.strip())
+            if 1 <= index <= len(extra_files):
+                selected_indices.append(index)
+            else:
+                cprint(f"  Номер {index} вне диапазона. Пропускаю.", 'warning')
+        except ValueError:
+            cprint(f"  Некорректный ввод '{part}'. Пропускаю.", 'warning')
+
+    if not selected_indices:
+        cprint("  Не выбрано ни одного корректного файла для переноса.", 'info')
+        return
+
+    cprint("  Перенос выбранных библиотек...", 'step')
+    for index in set(selected_indices): # Используем set для исключения дубликатов
+        try:
+            filename_to_move = extra_files[index - 1] # -1, так как список для пользователя 1-based
+            
+            src_file = os.path.join(old_lib_path, filename_to_move)
+            dest_file = os.path.join(new_lib_path, filename_to_move)
+            
+            cprint(f"    Копирование '{filename_to_move}'...", 'info')
+            shutil.copy2(src_file, dest_file) # copy2 сохраняет метаданные
+
+        except Exception as e:
+            cprint(f"    !!! Ошибка при копировании файла '{filename_to_move}': {e}", 'error')
+    
+    cprint("  Перенос завершен.", 'success')
 
 def upload_backup(config, source_versions_root, local_backup_path, service_name, source_type, ftp_conn=None):
     """
